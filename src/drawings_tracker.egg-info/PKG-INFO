@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: drawings-tracker
+Version: 0.1.0
+Summary: Local drawing tracker for comparing status exports and tracking changes
+Requires-Python: >=3.10
+Requires-Dist: fastapi<1.0,>=0.111
+Requires-Dist: openpyxl<4.0,>=3.1
+Requires-Dist: pandas<3.0,>=2.2
+Requires-Dist: selenium<5.0,>=4.20
+Requires-Dist: uvicorn[standard]<1.0,>=0.30
