@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import threading
 from pathlib import Path
 
 from selenium import webdriver
@@ -17,7 +18,15 @@ class SeleniumRunner:
     def __init__(self, download_dir: str | Path, headless: bool = True) -> None:
         self.download_dir = Path(download_dir).resolve()
         self.download_dir.mkdir(parents=True, exist_ok=True)
+        self._abort_requested = threading.Event()
         self.driver = self._build_driver(headless=headless)
+
+    def request_abort(self) -> None:
+        self._abort_requested.set()
+
+    def _check_abort(self) -> None:
+        if self._abort_requested.is_set():
+            raise RuntimeError("Workflow aborted by user.")
 
     def _build_driver(self, headless: bool) -> webdriver.Chrome:
         options = Options()
@@ -389,6 +398,7 @@ class SeleniumRunner:
         downloaded = False
         timeout_time = time.time() + timeout
         while time.time() < timeout_time:
+            self._check_abort()
             current_files = set(self.download_dir.iterdir())
             new_files = current_files - existing_files
             completed_files = [
@@ -481,14 +491,47 @@ class SeleniumRunner:
 
             # 3. Click download icon inside Adicionales tab
             print("Clicking additional file 'Descargar' (Adicionales)...")
-            existing_files_2 = set(self.download_dir.iterdir())
-            
-            # Locate the download link under the active Adicionales tab/container
-            download_link_2 = wait.until(EC.element_to_be_clickable((By.XPATH, "//div[contains(@style, 'display:inline') or not(contains(@style, 'display:none'))]/a[contains(@onclick, 'descargarArchivo') and .//i[contains(@class, 'zmdi-cloud-download')]]")))
-            self._click_element(download_link_2)
-            
-            # Wait for second download completion and move
-            self._wait_and_move_new_file(existing_files_2)
+
+            # The additional file is rendered in a Bootstrap ``col-md-6`` block
+            # inside the active Kendo tab.  Target that file block directly;
+            # checking the child div's inline style was too broad and could match
+            # unrelated/hidden download links elsewhere on the page.
+            additional_download_xpath = (
+                "//div[contains(@class, 'k-content') and "
+                "(contains(@class, 'k-state-active') or not(contains(@style, 'display: none')))]"
+                "//div[contains(concat(' ', normalize-space(@class), ' '), ' col-md-6 ')]"
+                "//a[contains(@onclick, 'descargarArchivo(') "
+                "and .//i[contains(@class, 'zmdi-cloud-download')]]"
+            )
+
+            def visible_additional_downloads(driver):
+                links = driver.find_elements(By.XPATH, additional_download_xpath)
+                visible_links = [link for link in links if link.is_displayed() and link.is_enabled()]
+                return visible_links or False
+
+            additional_links = wait.until(visible_additional_downloads)
+            additional_count = len(additional_links)
+            print(f"Found {additional_count} additional file(s) to download.")
+
+            for index in range(additional_count):
+                self._check_abort()
+                # Re-read the elements before each click in case the page updates
+                # the tab contents after a download and invalidates old elements.
+                current_links = wait.until(visible_additional_downloads)
+                if index >= len(current_links):
+                    print(
+                        "The Adicionales file list changed while downloading; "
+                        f"could not access item {index + 1}."
+                    )
+                    continue
+
+                existing_files_2 = set(self.download_dir.iterdir())
+                print(
+                    f"Downloading additional file {index + 1} "
+                    f"of {additional_count}..."
+                )
+                self._click_element(current_links[index])
+                self._wait_and_move_new_file(existing_files_2)
             
         except Exception as e:
             print(f"No additional file downloaded or failed to download Adicionales: {e}")

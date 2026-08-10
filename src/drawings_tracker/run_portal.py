@@ -1,11 +1,61 @@
 from __future__ import annotations
 
+import queue
+import threading
+
 from drawings_tracker.selenium_runner import SeleniumRunner, prompt_for_credentials
+
+
+class AbortRequested(Exception):
+    """Raised when the user requests cancellation from the terminal."""
+
+
+class AbortMonitor:
+    def __init__(self, on_abort) -> None:
+        self._on_abort = on_abort
+        self._aborted = threading.Event()
+        self._commands: queue.Queue[str] = queue.Queue()
+
+    @property
+    def aborted(self) -> bool:
+        return self._aborted.is_set()
+
+    def start(self) -> None:
+        threading.Thread(target=self._listen, daemon=True).start()
+        print("\nAbort control active: type ABORT and press Enter at any time.\n")
+
+    def _listen(self) -> None:
+        while not self.aborted:
+            try:
+                command = input().strip()
+            except (EOFError, KeyboardInterrupt):
+                return
+            if command.upper() in {"ABORT", "EXIT", "STOP"}:
+                self._aborted.set()
+                print("\nAbort requested. Stopping the browser and workflow...")
+                try:
+                    self._on_abort()
+                except Exception:
+                    pass
+                return
+            self._commands.put(command)
+
+    def check(self) -> None:
+        if self.aborted:
+            raise AbortRequested
+
+    def wait_for_command(self, prompt: str) -> str:
+        print(prompt, end="", flush=True)
+        while True:
+            self.check()
+            try:
+                return self._commands.get(timeout=0.1)
+            except queue.Empty:
+                continue
 
 
 def main() -> None:
     url = "https://sgc.cumbra.com.pe/AppMSSO/"
-    username, password = prompt_for_credentials()
     from pathlib import Path
     downloads_dir = Path("downloads").resolve()
     downloads_dir.mkdir(parents=True, exist_ok=True)
@@ -15,6 +65,27 @@ def main() -> None:
         [f for f in downloads_dir.glob("status_export_*.xlsx") if f.is_file()],
         key=lambda p: p.stat().st_mtime
     )
+
+    # A normal run compares one existing baseline with one newly downloaded
+    # export. If multiple baselines already exist, require an explicit command
+    # instead of silently choosing one from an ambiguous set.
+    if len(existing_exports) > 1:
+        print("\a")
+        print("!" * 70)
+        print("ALERT: MORE THAN TWO STATUS EXPORTS WOULD BE INVOLVED")
+        print("The following previous export files were found:")
+        for export_file in existing_exports:
+            print(f"  - {export_file.name}")
+        print("\nThe workflow has been paused before login or downloading.")
+        confirmation = input(
+            "Type CONTINUE to use the newest file as the baseline, "
+            "or press Enter to stop: "
+        ).strip()
+        if confirmation != "CONTINUE":
+            print("Stopped. No portal actions or comparisons were performed.")
+            return
+        print("Explicit CONTINUE command received. Resuming workflow.\n")
+
     previous_path = existing_exports[-1] if existing_exports else None
     
     if previous_path:
@@ -22,11 +93,29 @@ def main() -> None:
     else:
         print("No previous export file found in downloads/ to compare against.")
 
+    username, password = prompt_for_credentials()
     runner = SeleniumRunner(download_dir=downloads_dir, headless=False)
+    close_lock = threading.Lock()
+    browser_closed = False
+
+    def close_browser() -> None:
+        nonlocal browser_closed
+        with close_lock:
+            if browser_closed:
+                return
+            browser_closed = True
+            runner.request_abort()
+            runner.close()
+
+    abort_monitor = AbortMonitor(close_browser)
+    abort_monitor.start()
     try:
+        abort_monitor.check()
         runner.login(url, username, password)
+        abort_monitor.check()
         print("Login verified successfully. Proceeding through the repository flow...")
         export_path = runner.export_status_excel()
+        abort_monitor.check()
         print(f"Export step completed. File saved at: {export_path.name}")
         
         if previous_path:
@@ -35,6 +124,7 @@ def main() -> None:
             from drawings_tracker.core import DrawingTracker
             tracker = DrawingTracker()
             changes = tracker.compare_status_files(previous_path, export_path)
+            abort_monitor.check()
             
             # Print the comparison results
             print(f"\n==========================================")
@@ -67,6 +157,7 @@ def main() -> None:
                 change_types[item["drawing_id"]] = "UPDATED"
 
             if change_types:
+                abort_monitor.check()
                 import pandas as pd
                 latest_df = pd.read_excel(export_path)
                 
@@ -93,6 +184,7 @@ def main() -> None:
                         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                     
                     csv_filename = downloads_dir / f"changes_{timestamp}.csv"
+                    abort_monitor.check()
                     filtered_df.to_csv(csv_filename, index=False, encoding="utf-8-sig")
                     print(f"Comparison details saved to CSV: {csv_filename.name}")
                 else:
@@ -104,27 +196,40 @@ def main() -> None:
             if change_types:
                 print(f"\nStarting individual drawing downloads ({len(change_types)} files)...")
                 for i, drawing_id in enumerate(change_types.keys(), 1):
-                    user_input = input(f"\n[{i}/{len(change_types)}] Ready to download drawing: '{drawing_id}'. Press Enter to proceed (or type 'skip' to skip, 'abort' to stop): ").strip().lower()
-                    if user_input in ("abort", "exit", "stop"):
-                        print("Aborting drawing downloads as requested.")
-                        break
-                    elif user_input == "skip":
+                    user_input = abort_monitor.wait_for_command(
+                        f"\n[{i}/{len(change_types)}] Ready to download drawing: "
+                        f"'{drawing_id}'. Press Enter to proceed (or type 'skip' "
+                        "to skip, 'ABORT' to stop): "
+                    ).strip().lower()
+                    if user_input == "skip":
                         print(f"Skipping download for '{drawing_id}'.")
                         continue
                     try:
+                        abort_monitor.check()
                         runner.download_drawing(drawing_id)
+                        abort_monitor.check()
                     except Exception as download_err:
+                        abort_monitor.check()
                         print(f"Error downloading '{drawing_id}': {download_err}")
                 
             print(f"==========================================\n")
         else:
             print("\nSkipping comparison because no previous export file existed before this run.")
             
-    except RuntimeError as e:
+    except AbortRequested:
+        print("Workflow aborted by user. No further actions will be performed.")
+        return
+    except Exception as e:
+        if abort_monitor.aborted:
+            print("Workflow aborted by user. No further actions will be performed.")
+            return
         print(f"Error: {e}")
         return
     finally:
-        runner.close()
+        try:
+            close_browser()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
