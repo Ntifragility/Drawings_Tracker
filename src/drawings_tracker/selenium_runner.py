@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 
 from selenium import webdriver
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium.common.exceptions import NoSuchElementException, TimeoutException, StaleElementReferenceException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
@@ -15,7 +15,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 class SeleniumRunner:
     def __init__(self, download_dir: str | Path, headless: bool = True) -> None:
-        self.download_dir = Path(download_dir)
+        self.download_dir = Path(download_dir).resolve()
         self.download_dir.mkdir(parents=True, exist_ok=True)
         self.driver = self._build_driver(headless=headless)
 
@@ -41,15 +41,14 @@ class SeleniumRunner:
 
     def _has_visible_error_message(self) -> bool:
         keywords = ("error", "fallido", "no acceso", "incorrect", "credenciales")
-        for element in self.driver.find_elements(By.XPATH, "//*[contains(normalize-space(.), '')]"):
-            try:
-                if not element.is_displayed():
-                    continue
-                text = element.text.lower()
-                if any(keyword in text for keyword in keywords):
+        try:
+            body_element = self.driver.find_element(By.TAG_NAME, "body")
+            if body_element.is_displayed():
+                body_text = body_element.text.lower()
+                if any(keyword in body_text for keyword in keywords):
                     return True
-            except Exception:
-                continue
+        except Exception:
+            pass
         return False
 
     def _is_login_form_present(self) -> bool:
@@ -133,10 +132,33 @@ class SeleniumRunner:
         ]
         return self._find_first_element(candidates, timeout=2.0)
 
+    def _ensure_filtros_unfolded(self, timeout: int = 15) -> None:
+        wait = WebDriverWait(self.driver, timeout)
+        try:
+            toggle_anchor = wait.until(EC.presence_of_element_located((By.XPATH, "//a[contains(@onclick, 'filtroToogle')]")))
+            folded_indicator = toggle_anchor.find_element(By.XPATH, ".//span[contains(@class, 'toggleButton') and .//i[contains(@class, 'zmdi-chevron-down')]]")
+            
+            style_attr = folded_indicator.get_attribute("style") or ""
+            if "display: none" not in style_attr:
+                print("Filtros section is folded. Clicking toggle button to unfold...")
+                self._click_element(toggle_anchor)
+                time.sleep(1.0)
+            else:
+                print("Filtros section is already unfolded.")
+        except Exception as e:
+            print(f"Warning: Could not determine Filtros unfold status via toggle buttons ({e}). Trying fallback check...")
+            try:
+                search_input = self.driver.find_element(By.ID, "Codigo")
+                if not search_input.is_displayed():
+                    filters_button = wait.until(EC.element_to_be_clickable((By.XPATH, "//a[contains(@onclick, 'filtroToogle')]")))
+                    self._click_element(filters_button)
+                    time.sleep(1.0)
+            except Exception as fallback_err:
+                print(f"Warning: Fallback Filtros unfold failed: {fallback_err}")
+
     def login(self, url: str, username: str, password: str) -> None:
         self.driver.get(url)
         wait = WebDriverWait(self.driver, 20)
-        initial_url = self.driver.current_url
 
         try:
             externo_tab = wait.until(EC.element_to_be_clickable((By.ID, "headerExterno")))
@@ -172,27 +194,22 @@ class SeleniumRunner:
             except Exception as fallback_error:
                 raise RuntimeError(f"Could not find or click 'Ingresar' button: {e}; fallback error: {fallback_error}")
 
-        self._wait_for_page_ready(timeout=10)
-        current_url = self.driver.current_url
+        # Wait for the login redirection to complete by checking the DOM for the main page sidebar or error indicators
+        print("Verifying login redirection...")
+        try:
+            WebDriverWait(self.driver, 20).until(
+                lambda d: d.find_elements(By.CSS_SELECTOR, "#menu-trigger") or self._has_visible_error_message()
+            )
+        except TimeoutException:
+            pass
 
+        current_url = self.driver.current_url
         if self._has_visible_error_message():
             raise RuntimeError(f"Login failed. The portal returned an explicit error message. URL: {current_url}")
 
-        if current_url == initial_url and self._is_login_form_present():
-            print("The sign-in action was sent, but the portal stayed on the login form. Waiting a bit longer...")
-            time.sleep(8)
-            current_url = self.driver.current_url
+        if self._is_login_form_present():
+            raise RuntimeError(f"Login failed. Still on login page. URL: {current_url}")
 
-            if self._has_visible_error_message():
-                raise RuntimeError(f"Login failed. The portal returned an explicit error message. URL: {current_url}")
-
-            if current_url == initial_url and self._is_login_form_present():
-                print(f"Portal still on the login form after submit. URL: {current_url}")
-                print(f"Page title: {self.driver.title}")
-                return
-
-        print("Login command sent; waiting briefly for the portal to settle...")
-        time.sleep(2)
         print("Login verified: Credentials accepted.")
 
     def export_status_excel(self, timeout: int = 45) -> Path:
@@ -203,7 +220,15 @@ class SeleniumRunner:
             print("Clicking 'Repositorio'...")
             self._click_element(repo_menu)
         except TimeoutException as e:
-            raise RuntimeError(f"Could not click Repositorio menu: {e}")
+            try:
+                print("Sidebar menu might be folded. Clicking menu-trigger to unfold...")
+                menu_trigger = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#menu-trigger")))
+                self._click_element(menu_trigger)
+                repo_menu = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "li.sub-menu[data-menu='Explorador'] a.prevent-dragging")))
+                print("Clicking 'Repositorio'...")
+                self._click_element(repo_menu)
+            except Exception as trigger_err:
+                raise RuntimeError(f"Could not click Repositorio menu even after attempting to toggle sidebar: {e}; trigger error: {trigger_err}")
 
         try:
             explorer_link = wait.until(EC.element_to_be_clickable((By.XPATH, "//a[contains(@href, '/AppSGD/Documentos/Carpeta/Explorador') and contains(normalize-space(.), 'Explorador')]")))
@@ -214,12 +239,7 @@ class SeleniumRunner:
 
         self._wait_for_page_ready(timeout=10)
 
-        try:
-            filters_button = wait.until(EC.element_to_be_clickable((By.XPATH, "//*[contains(normalize-space(.), 'Filtros')]")))
-            print("Clicking 'Filtros'...")
-            self._click_element(filters_button)
-        except TimeoutException as e:
-            raise RuntimeError(f"Could not click Filtros: {e}")
+        self._ensure_filtros_unfolded(timeout=timeout)
 
         try:
             discipline_input = wait.until(
@@ -236,18 +256,33 @@ class SeleniumRunner:
             raise RuntimeError(f"Could not click Disciplina input field: {e}")
 
         try:
-            electricity_option = wait.until(
-                EC.element_to_be_clickable(
-                    (
-                        By.XPATH,
-                        "//li[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'electricidad')]",
-                    )
-                )
+            listbox = wait.until(
+                EC.visibility_of_element_located((By.XPATH, "//*[contains(@id, 'Disciplina_listbox')]"))
             )
-            print("Selecting 'Electricidad'...")
-            self._click_element(electricity_option)
+            wait.until(
+                lambda d: len(listbox.find_elements(By.TAG_NAME, "li")) > 0
+            )
         except TimeoutException as e:
-            raise RuntimeError(f"Could not select Electricidad option from the list: {e}")
+            raise RuntimeError(f"Dropdown list did not populate in time: {e}")
+
+        try:
+            def click_electricity(d):
+                try:
+                    el = d.find_element(
+                        By.XPATH,
+                        "//li[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'electrica')]",
+                    )
+                    if el.is_displayed() and el.is_enabled():
+                        self._click_element(el)
+                        return True
+                except (StaleElementReferenceException, NoSuchElementException):
+                    pass
+                return False
+
+            print("Selecting 'ELECTRICA'...")
+            wait.until(click_electricity)
+        except TimeoutException as e:
+            raise RuntimeError(f"Could not locate or click ELECTRICA option: {e}")
 
         try:
             buscar_button = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(normalize-space(.), 'Buscar')]")))
@@ -257,6 +292,28 @@ class SeleniumRunner:
             raise RuntimeError(f"Could not click Buscar button: {e}")
 
         self._wait_for_page_ready(timeout=10)
+        
+        try:
+            WebDriverWait(self.driver, 2).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, ".k-loading-mask, .loading-mask, .k-loading-image, .loading, .spinner"))
+            )
+        except TimeoutException:
+            pass
+
+        try:
+            WebDriverWait(self.driver, 60).until_not(
+                EC.presence_of_element_located((By.CSS_SELECTOR, ".k-loading-mask, .loading-mask, .k-loading-image, .loading, .spinner"))
+            )
+        except TimeoutException as e:
+            raise RuntimeError(f"Page loading mask did not disappear: {e}")
+
+        print("Waiting for grid rows to render in DOM...")
+        try:
+            WebDriverWait(self.driver, 30).until(
+                lambda d: len(d.find_elements(By.CSS_SELECTOR, ".k-grid-content tbody tr, table tbody tr, .grid-row")) > 0
+            )
+        except TimeoutException as e:
+            raise RuntimeError(f"Grid data rows did not render in the DOM: {e}")
 
         try:
             export_button = wait.until(
@@ -286,9 +343,155 @@ class SeleniumRunner:
         except TimeoutException as e:
             raise RuntimeError(f"Could not click Excel option: {e}")
 
-        print("Waiting 15 seconds for the export to complete...")
-        time.sleep(15)
-        return self.download_dir / "status_export.xlsx"
+        print("Waiting for the export to complete...")
+        existing_files = set(self.download_dir.iterdir())
+        
+        downloaded_file = None
+        timeout_time = time.time() + 60
+        while time.time() < timeout_time:
+            current_files = set(self.download_dir.iterdir())
+            new_files = current_files - existing_files
+            completed_files = [
+                f for f in new_files
+                if f.is_file() and not f.name.endswith(".crdownload") and not f.name.endswith(".tmp")
+            ]
+            if completed_files:
+                downloaded_file = max(completed_files, key=lambda p: p.stat().st_mtime)
+                break
+            time.sleep(1)
+
+        if not downloaded_file:
+            for f in self.download_dir.glob("*.xlsx"):
+                if f not in existing_files:
+                    downloaded_file = f
+                    break
+
+        if downloaded_file:
+            import datetime
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            target_path = self.download_dir / f"status_export_{timestamp}.xlsx"
+            if target_path.exists():
+                try:
+                    target_path.unlink()
+                except Exception:
+                    pass
+            try:
+                downloaded_file.rename(target_path)
+                print(f"File downloaded and saved as: {target_path.name}")
+                return target_path
+            except Exception as e:
+                print(f"Could not rename downloaded file to {target_path.name}: {e}")
+                return downloaded_file
+
+        raise RuntimeError("Download timed out or failed to complete.")
+
+    def _wait_and_move_new_file(self, existing_files: set[Path], timeout: int = 30) -> bool:
+        downloaded = False
+        timeout_time = time.time() + timeout
+        while time.time() < timeout_time:
+            current_files = set(self.download_dir.iterdir())
+            new_files = current_files - existing_files
+            completed_files = [
+                f for f in new_files
+                if f.is_file() and not f.name.endswith(".crdownload") and not f.name.endswith(".tmp")
+            ]
+            if completed_files:
+                downloaded = True
+                new_file = max(completed_files, key=lambda p: p.stat().st_mtime)
+                print(f"Successfully downloaded file: {new_file.name}")
+                
+                # Move the file to drawings directory
+                drawings_dir = Path("drawings").resolve()
+                drawings_dir.mkdir(parents=True, exist_ok=True)
+                dest_file = drawings_dir / new_file.name
+                try:
+                    if dest_file.exists():
+                        dest_file.unlink()
+                    new_file.rename(dest_file)
+                    print(f"Moved drawing file to: drawings/{new_file.name}")
+                except Exception as move_err:
+                    print(f"Could not move file to drawings folder: {move_err}")
+                break
+            time.sleep(1)
+
+        if not downloaded:
+            print("Warning: New download not detected in 30 seconds.")
+        return downloaded
+
+    def download_drawing(self, drawing_id: str, timeout: int = 30) -> None:
+        wait = WebDriverWait(self.driver, timeout)
+
+        self._ensure_filtros_unfolded(timeout=timeout)
+
+        # 1. Locate search input, enter drawing tag, and click Buscar button
+        try:
+            search_input = wait.until(EC.element_to_be_clickable((By.ID, "Codigo")))
+            search_input.clear()
+            search_input.send_keys(drawing_id)
+            print(f"Pasted drawing tag: '{drawing_id}' into search field...")
+            
+            buscar_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(@onclick, 'buscarClick') or contains(@class, 'bgm-orange')]")))
+            self._click_element(buscar_btn)
+            print("Clicked search 'Buscar' button...")
+        except TimeoutException as e:
+            raise RuntimeError(f"Could not locate search elements: {e}")
+
+        # 2. Wait for dynamic content reload (loading masks to disappear)
+        try:
+            time.sleep(1.5)
+            WebDriverWait(self.driver, 15).until_not(
+                EC.presence_of_element_located((By.CSS_SELECTOR, ".k-loading-mask, .loading-mask, .k-loading-image, .loading, .spinner"))
+            )
+        except TimeoutException:
+            pass
+
+        # === DOWNLOAD FILE 1 (Main Drawing) ===
+        # 3. Click the dropdown button to expand actions
+        try:
+            btn_expanded = wait.until(EC.element_to_be_clickable((By.ID, "btnExpaded")))
+            self._click_element(btn_expanded)
+        except TimeoutException as e:
+            raise RuntimeError(f"Could not find or click expanded button 'btnExpaded': {e}")
+
+        # 4. Click 'Descargar' option
+        try:
+            download_link = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "li.descarga a")))
+            existing_files = set(self.download_dir.iterdir())
+            self._click_element(download_link)
+            print("Clicking main drawing 'Descargar'...")
+        except TimeoutException as e:
+            raise RuntimeError(f"Could not find or click main 'Descargar' link: {e}")
+
+        # Wait for first download completion and move to drawings folder
+        self._wait_and_move_new_file(existing_files)
+
+        # === DOWNLOAD FILE 2 (Adicionales) ===
+        try:
+            # 1. Click Expand icon in the hierarchy cell
+            print("Clicking master row expand button...")
+            expand_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "tr.k-master-row td.k-hierarchy-cell a.k-i-expand")))
+            self._click_element(expand_btn)
+            time.sleep(1.5) # Wait briefly for tabstrip to render
+
+            # 2. Click on "Adicionales" tab link
+            print("Clicking 'Adicionales' tab link...")
+            adicionales_tab = wait.until(EC.element_to_be_clickable((By.XPATH, "//a[contains(@class, 'k-link') and contains(normalize-space(.), 'Adicionales')]")))
+            self._click_element(adicionales_tab)
+            time.sleep(1.0) # Wait briefly for additional files list to show
+
+            # 3. Click download icon inside Adicionales tab
+            print("Clicking additional file 'Descargar' (Adicionales)...")
+            existing_files_2 = set(self.download_dir.iterdir())
+            
+            # Locate the download link under the active Adicionales tab/container
+            download_link_2 = wait.until(EC.element_to_be_clickable((By.XPATH, "//div[contains(@style, 'display:inline') or not(contains(@style, 'display:none'))]/a[contains(@onclick, 'descargarArchivo') and .//i[contains(@class, 'zmdi-cloud-download')]]")))
+            self._click_element(download_link_2)
+            
+            # Wait for second download completion and move
+            self._wait_and_move_new_file(existing_files_2)
+            
+        except Exception as e:
+            print(f"No additional file downloaded or failed to download Adicionales: {e}")
 
     def close(self) -> None:
         self.driver.quit()
@@ -296,16 +499,5 @@ class SeleniumRunner:
 
 def prompt_for_credentials() -> tuple[str, str]:
     username = input("Username: ").strip()
-    
-    while True:
-        password = input("Password: ").strip()
-        print(f"\nPassword entered: {password}")
-        print(f"Password length: {len(password)} characters")
-        confirm = input("Is this correct? (y/n): ").strip().lower()
-        if confirm == "y":
-            print()
-            break
-        else:
-            print("Please try again.\n")
-    
+    password = input("Password: ").strip()
     return username, password

@@ -27,16 +27,23 @@ class DrawingTracker:
     def _load_history(self) -> pd.DataFrame:
         if not self.history_path.exists():
             return pd.DataFrame(columns=["drawing_id", "revision", "status", "project_code", "source_file", "timestamp"])
-        return pd.read_csv(self.history_path)
+        return pd.read_csv(self.history_path, encoding="utf-8-sig")
 
     def _save_history(self, history: pd.DataFrame) -> None:
-        history.to_csv(self.history_path, index=False)
+        history.to_csv(self.history_path, index=False, encoding="utf-8-sig")
 
     def _find_column(self, frame: pd.DataFrame, *candidates: str) -> str | None:
-        normalized = {str(column).strip().lower().replace(" ", "_"): column for column in frame.columns}
+        import unicodedata
+        def normalize_str(s: str) -> str:
+            # lower, replace space, strip accents
+            n = s.strip().lower().replace(" ", "_")
+            return "".join(c for c in unicodedata.normalize('NFD', n) if unicodedata.category(c) != 'Mn')
+            
+        normalized = {normalize_str(str(column)): column for column in frame.columns}
         for candidate in candidates:
-            if candidate in normalized:
-                return normalized[candidate]
+            norm_candidate = normalize_str(candidate)
+            if norm_candidate in normalized:
+                return normalized[norm_candidate]
         return None
 
     def compare_status_files(self, previous_file: str | Path, latest_file: str | Path) -> dict[str, Any]:
@@ -49,13 +56,13 @@ class DrawingTracker:
         previous_df = previous_df.copy()
         latest_df = latest_df.copy()
 
-        drawing_column = self._find_column(latest_df, "drawing_id", "drawing", "drawing_no", "drawingnumber")
+        drawing_column = self._find_column(latest_df, "drawing_id", "drawing", "drawing_no", "drawingnumber", "codigo")
         project_column = self._find_column(latest_df, "project_code", "project", "projectcode")
-        revision_column = self._find_column(latest_df, "revision", "rev")
-        status_column = self._find_column(latest_df, "status", "state")
+        revision_column = self._find_column(latest_df, "revision", "rev", "revision")
+        status_column = self._find_column(latest_df, "status", "state", "estado")
 
         if drawing_column is None:
-            raise ValueError("The Excel file must contain a drawing identifier column such as 'drawing_id'.")
+            raise ValueError("The Excel file must contain a drawing identifier column such as 'drawing_id' or 'codigo'.")
 
         previous_df["drawing_id"] = previous_df[drawing_column].astype(str).str.strip()
         latest_df["drawing_id"] = latest_df[drawing_column].astype(str).str.strip()
@@ -92,7 +99,7 @@ class DrawingTracker:
             prev_status = str(previous_row["status"])
             latest_status = str(latest_row["status"])
 
-            if prev_revision != latest_revision or prev_status != latest_status:
+            if prev_revision != latest_revision:
                 updated_drawings.append({
                     "drawing_id": drawing_id,
                     "previous_revision": prev_revision,
