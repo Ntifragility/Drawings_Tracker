@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import json
+import re
 import time
 import threading
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from selenium import webdriver
 from selenium.common.exceptions import NoSuchElementException, TimeoutException, StaleElementReferenceException
@@ -27,6 +31,66 @@ class SeleniumRunner:
     def _check_abort(self) -> None:
         if self._abort_requested.is_set():
             raise RuntimeError("Workflow aborted by user.")
+
+    def _capture_diagnostic(self, stage: str) -> None:
+        """Save local browser evidence without interrupting the workflow."""
+        try:
+            diagnostics_dir = Path("diagnostics").resolve()
+            diagnostics_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            safe_stage = re.sub(r"[^A-Za-z0-9_-]+", "_", stage).strip("_")
+            stem = diagnostics_dir / f"{timestamp}_{safe_stage}"
+
+            page_html = self.driver.page_source
+            page_html = re.sub(
+                r'(<input[^>]*type=["\']password["\'][^>]*value=)["\'][^"\']*["\']',
+                r'\1"[REDACTED]"',
+                page_html,
+                flags=re.IGNORECASE,
+            )
+            stem.with_suffix(".html").write_text(page_html, encoding="utf-8")
+            self.driver.save_screenshot(str(stem.with_suffix(".png")))
+
+            current_url = urlsplit(self.driver.current_url)
+            safe_url = urlunsplit(
+                (current_url.scheme, current_url.netloc, current_url.path, "", "")
+            )
+            download_links = []
+            for link in self.driver.find_elements(
+                By.XPATH, "//a[contains(@onclick, 'descargarArchivo(')]"
+            ):
+                download_links.append(
+                    {
+                        "displayed": link.is_displayed(),
+                        "enabled": link.is_enabled(),
+                        "text": link.text.strip(),
+                        "onclick": link.get_attribute("onclick"),
+                        "class": link.get_attribute("class"),
+                    }
+                )
+            frames = [
+                {
+                    "id": frame.get_attribute("id"),
+                    "name": frame.get_attribute("name"),
+                    "src": frame.get_attribute("src"),
+                }
+                for frame in self.driver.find_elements(By.TAG_NAME, "iframe")
+            ]
+            metadata = {
+                "stage": stage,
+                "captured_at": datetime.now().isoformat(timespec="seconds"),
+                "url_without_query": safe_url,
+                "title": self.driver.title,
+                "download_links": download_links,
+                "iframes": frames,
+            }
+            stem.with_suffix(".json").write_text(
+                json.dumps(metadata, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            print(f"Diagnostic captured: diagnostics/{stem.name}.*")
+        except Exception as diagnostic_error:
+            print(f"Could not capture diagnostic for '{stage}': {diagnostic_error}")
 
     def _build_driver(self, headless: bool) -> webdriver.Chrome:
         options = Options()
@@ -429,6 +493,10 @@ class SeleniumRunner:
         return downloaded
 
     def download_drawing(self, drawing_id: str, timeout: int = 30) -> None:
+        drawing_id = "" if drawing_id is None else str(drawing_id).strip()
+        if not drawing_id or drawing_id.lower() in {"nan", "none", "nat"}:
+            raise ValueError("Cannot download a drawing without a valid drawing ID.")
+
         wait = WebDriverWait(self.driver, timeout)
 
         self._ensure_filtros_unfolded(timeout=timeout)
@@ -482,12 +550,14 @@ class SeleniumRunner:
             expand_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "tr.k-master-row td.k-hierarchy-cell a.k-i-expand")))
             self._click_element(expand_btn)
             time.sleep(1.5) # Wait briefly for tabstrip to render
+            self._capture_diagnostic(f"{drawing_id}_details_expanded")
 
             # 2. Click on "Adicionales" tab link
             print("Clicking 'Adicionales' tab link...")
             adicionales_tab = wait.until(EC.element_to_be_clickable((By.XPATH, "//a[contains(@class, 'k-link') and contains(normalize-space(.), 'Adicionales')]")))
             self._click_element(adicionales_tab)
             time.sleep(1.0) # Wait briefly for additional files list to show
+            self._capture_diagnostic(f"{drawing_id}_adicionales_open")
 
             # 3. Click download icon inside Adicionales tab
             print("Clicking additional file 'Descargar' (Adicionales)...")
@@ -534,6 +604,7 @@ class SeleniumRunner:
                 self._wait_and_move_new_file(existing_files_2)
             
         except Exception as e:
+            self._capture_diagnostic(f"{drawing_id}_adicionales_failure")
             print(f"No additional file downloaded or failed to download Adicionales: {e}")
 
     def close(self) -> None:

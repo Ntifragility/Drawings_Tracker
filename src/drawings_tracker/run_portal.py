@@ -151,10 +151,27 @@ def main() -> None:
             
             # Map each changed drawing ID to its change type (NEW or UPDATED)
             change_types = {}
+            skipped_missing_ids = 0
             for item in changes["new_drawings"]:
-                change_types[item["drawing_id"]] = "NEW"
+                raw_drawing_id = item.get("drawing_id")
+                drawing_id = "" if raw_drawing_id is None else str(raw_drawing_id).strip()
+                if not drawing_id or drawing_id.lower() in {"nan", "none", "nat"}:
+                    skipped_missing_ids += 1
+                    continue
+                change_types[drawing_id] = "NEW"
             for item in changes["updated_drawings"]:
-                change_types[item["drawing_id"]] = "UPDATED"
+                raw_drawing_id = item.get("drawing_id")
+                drawing_id = "" if raw_drawing_id is None else str(raw_drawing_id).strip()
+                if not drawing_id or drawing_id.lower() in {"nan", "none", "nat"}:
+                    skipped_missing_ids += 1
+                    continue
+                change_types[drawing_id] = "UPDATED"
+
+            if skipped_missing_ids:
+                print(
+                    f"Warning: skipped {skipped_missing_ids} changed row(s) "
+                    "because the drawing ID was missing."
+                )
 
             if change_types:
                 abort_monitor.check()
